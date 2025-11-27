@@ -1,0 +1,129 @@
+# app.py
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from prophet import Prophet
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import numpy as np
+from datetime importlib.metadata import version
+
+st.set_page_config(page_title="Sales Revenue Forecaster", layout="wide", page_icon="chart_with_upwards_trend")
+
+st.markdown("""
+<style>
+    .big-font {font-size: 60px !important; font-weight: bold; color: #00D4FF;}
+    .metric-card {background: linear-gradient(90deg, #1E1E2F, #2D1B69); padding: 20px; border-radius: 15px;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("Sales Revenue Forecaster")
+st.markdown("### Made for e-commerce owners & Shopify stores")
+
+# Sidebar
+st.sidebar.header("Upload Your Sales Data")
+uploaded_file = st.sidebar.file_uploader("CSV or Excel", type=["csv", "xlsx"])
+
+@st.cache_data
+def load_data(file):
+    if file.name.endswith(".xlsx"):
+        df = pd.read_excel(file)
+    else:
+        df = pd.read_csv(file)
+    return df
+
+if uploaded_file is not None:
+    df = load_data(uploaded_file)
+else:
+    df = pd.read_csv("data/sales_data.csv")
+    st.info("Demo mode — using sample e-commerce data (2021–2025)")
+
+# Auto detect date & revenue columns
+date_col = st.sidebar.selectbox("Select Date Column", df.columns)
+revenue_col = st.sidebar.selectbox("Select Revenue Column", df.columns)
+
+df[date_col] = pd.to_datetime(df[date_col])
+df = df.sort_values(date_col)
+df = df[[date_col, revenue_col]].dropna()
+df.columns = ["ds", "y"]
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("Total Revenue", f"${df['y'].sum():,.0f}")
+with col2:
+    st.metric("Avg Monthly", f"${df['y'].mean():,.0f}")
+with col3:
+    growth = ((df['y'].iloc[-1] - df['y'].iloc[0]) / df['y'].iloc[0]) * 100
+    st.metric("Growth", f"{growth:.1f}%", delta=f"{growth:.1f}%")
+
+# Historical chart
+fig_hist = px.line(df, x="ds", y="y", title="Historical Revenue")
+fig_hist.update_layout(template="plotly_dark", height=500)
+st.plotly_chart(fig_hist, use_container_width=True)
+
+# Model choice
+model_choice = st.selectbox("Choose Forecasting Model", ["Prophet (Best for trends)", "XGBoost (Best for complex patterns)"])
+
+# Forecast period
+periods = st.slider("Forecast Next", 30, 365, 90)
+
+# What-if growth multiplier
+growth_multiplier = st.slider("What-if Growth Boost?", 0.8, 2.0, 1.0, 0.1,
+                              help="1.0 = current trend, 1.5 = 50% faster growth")
+
+if st.button("Generate Forecast"):
+    with st.spinner("Training model..."):
+        future_df = pd.DataFrame()
+        future_df['ds'] = pd.date_range(start=df['ds'].max(), periods=periods+1, freq='D')[1:]
+
+        if model_choice == "Prophet (Best for trends)":
+            m = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+            m.fit(df)
+            forecast = m.predict(future_df)
+        else:
+            # XGBoost prep
+            X_train = np.arange(len(df)).reshape(-1, 1)
+            y_train = df['y'].values
+            model = XGBRegressor()
+            model.fit(X_train, y_train)
+            X_future = np.arange(len(df), len(df)+periods).reshape(-1, 1)
+            pred = model.predict(X_future)
+            forecast = future_df.copy()
+            forecast['yhat'] = pred * growth_multiplier
+            forecast['yhat_lower'] = pred * 0.9 * growth_multiplier
+            forecast['yhat_upper'] = pred * 1.1 * growth_multiplier
+
+        forecast['yhat'] *= growth_multiplier
+
+        # Combine
+        full = pd.concat([df[['ds', 'y']].rename(columns={'y': 'Actual'}), 
+                         forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].rename(columns={'yhat': 'Forecast'})], 
+                         axis=0)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df['ds'], y=df['y'], mode='lines', name='Historical', line=dict(color="#00D4FF")))
+        fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], mode='lines', name='Forecast', line=dict(color="#FF6B6B")))
+        fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_upper'], fill=None, mode='lines', line_color='rgba(0,0,0,0)', showlegend=False))
+        fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], fill='tonexty', mode='lines', line_color='rgba(0,0,0,0)', fillcolor='rgba(255,107,107,0.2)', name='Confidence'))
+        fig.update_layout(title=f"Revenue Forecast — Next {periods} Days", template="plotly_dark", height=600)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Metrics
+        if len(df) > 12:
+            train = df[:-12]
+            test = df[-12:]
+            m_test = Prophet().fit(train)
+            future_test = m_test.make_future_dataframe(periods=12, freq='MS')
+            pred_test = m_test.predict(future_test)
+            mae = mean_absolute_error(test['y'], pred_test['yhat'][-12:])
+            mape = np.mean(np.abs((test['y'] - pred_test['yhat'][-12:]) / test['y'])) * 100
+            col1, col2 = st.columns(2)
+            col1.metric("Backtest MAE", f"${mae:,.0f}")
+            col2.metric("Backtest MAPE", f"{mape:.1f}%")
+
+        # Download
+        csv = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_csv(index=False)
+        st.download_button("Download Forecast CSV", csv, "forecast.csv", "text/csv")
+
+        st.success(f"Forecast complete! Expected revenue in next {periods} days: **${forecast['yhat'].sum():,.0f}**")
